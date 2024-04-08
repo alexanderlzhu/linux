@@ -2895,6 +2895,10 @@ static void __split_huge_page(struct page *page, struct list_head *list,
 	struct address_space *swap_cache = NULL;
 	unsigned long offset = 0;
 	int i, nr_dropped = 0;
+
+	struct folio_batch folios_to_free;
+	folio_batch_init(&folios_to_free);
+	int nr_folios_to_free = 0;
 	unsigned int new_nr = 1 << new_order;
 	int order = folio_order(folio);
 	unsigned int nr = 1 << order;
@@ -2986,7 +2990,37 @@ static void __split_huge_page(struct page *page, struct list_head *list,
 		folio_unlock(new_folio);
 
 		/*
-		 * Subpages may be freed if there wasn't any mapping
+		 * If a folio has only two references left, one inherited
+		 * from the isolation of its head and the other from
+		 * lru_add_page_tail() which we are about to drop, it means this
+		 * tail page was concurrently zapped. Then we can safely free it
+		 * and save page reclaim or migration the trouble of trying it.
+		 */
+		if (list && folio_ref_freeze(new_folio, 2)) {
+			VM_BUG_ON_FOLIO(folio_test_lru(new_folio), new_folio);
+			VM_BUG_ON_FOLIO(folio_test_large(new_folio), new_folio);
+			VM_BUG_ON_FOLIO(folio_mapped(new_folio), new_folio);
+
+			folio_clear_active(new_folio);
+			folio_clear_unevictable(new_folio);
+
+			if (folio_batch_add(&folios_to_free, new_folio) > 0) {
+				nr_folios_to_free++;
+			}
+			continue;
+		}
+
+		/*
+		 * If a tail page has only one reference left, it will be freed
+		 * by the call to free_page_and_swap_cache below. Since zero
+		 * new_folios are no longer remapped, there will only be one
+		 * reference left in cases outside of reclaim or migration.
+		 */
+		if (folio_ref_count(new_folio) == 1)
+			nr_folios_to_free++;
+
+		/*
+		 * new_folios may be freed if there wasn't any mapping
 		 * like if add_to_swap() is running on a lru page that
 		 * had its mapping zapped. And freeing these pages
 		 * requires taking the lru_lock so we do the put_page
@@ -2994,6 +3028,13 @@ static void __split_huge_page(struct page *page, struct list_head *list,
 		 */
 		free_page_and_swap_cache(subpage);
 	}
+
+	if (!nr_folios_to_free)
+		return;
+
+	mem_cgroup_uncharge_folios(&folios_to_free);
+	free_unref_folios(&folios_to_free);
+	count_vm_events(THP_SPLIT_FREE, nr_folios_to_free);
 }
 
 /* Racy check whether the huge page can be split */
